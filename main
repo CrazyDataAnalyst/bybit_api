@@ -4,3 +4,135 @@ version: 1.0.0
 codeOwners:
   - '0x22F218f0E4346D0eDC01516aE7966cF43CDb7F08'
 quorum: 1
+
+import requests
+import json
+import time
+import pandas as pd
+import numpy as np
+import datetime as dt
+import gspread
+from df2gspread import df2gspread as d2g
+from oauth2client.service_account import ServiceAccountCredentials
+from pybit.unified_trading import HTTP
+from openpyxl import load_workbook
+
+def requestBinance(url,symbol=''):
+    req = json.loads(requests.get(url.format(symbol)).text)
+    return req
+
+urlBinance_base = 'https://fapi.binance.com'
+urlBinance_tickers = '/fapi/v1/ticker/24hr'
+paramsBinance = '?symbol={}'
+urlBinance = urlBinance_base + urlBinance_tickers + paramsBinance
+
+def getklineBinance(symbol,interval='1d',limit=1):
+    req = requestBinance(urlBinance_base+'/fapi/v1/klines'+f'?symbol={symbol}'+f'&interval={interval}'+f'&limit={limit}')
+    l = []
+    for i in range(0, len(req)):
+        d = {'openTime' : int(req[i][0]),
+        'openPrice' : float(req[i][1]),
+        'highPrice' : float(req[i][2]),
+        'lowPrice' : float(req[i][3]),
+        'closePrice' : float(req[i][4]),
+        'closeTime' : int(req[i][6])}
+        l.append(d)
+    return l
+
+def findAtr(limit=14, endPeriod=5, symbol='BTCUSDT'):
+    startPeriod = 3
+
+    dfKline = pd.DataFrame(getklineBinance(limit=limit, symbol=symbol))
+    dfKline.sort_values('openTime', ascending=False, inplace=True)
+    dfKline['atr'] = dfKline.highPrice - dfKline.lowPrice
+
+    # Check if endPeriod is greater than the specified limit
+    if endPeriod > limit:
+        return 'Unable to find ATR within the given limit'
+
+    min_std = float('inf')  # Initialize with infinity
+    best_avg_atr = None
+    best_period = startPeriod
+    #atr_final = []
+
+    # Keep searching for the best average ATR until a valid result is found
+    while best_avg_atr is None and endPeriod < limit:
+        for period in range(startPeriod, endPeriod + 1):
+            atr_list = dfKline['atr'].values[1:period + 1]
+            atr_med = np.median(atr_list)
+
+            atr_normal = [atr for atr in atr_list if atr_med / 2 < atr < 2 * atr_med]
+
+            atr_len = len(atr_normal)
+
+            if startPeriod <= atr_len <= endPeriod:
+                std_dev = np.std(atr_normal)
+                if std_dev < min_std:
+                    min_std = std_dev
+                    best_avg_atr = np.mean(atr_normal)
+                    #atr_final = atr_normal
+
+        # If a valid result is not found, increment endPeriod by 1
+        endPeriod += 1
+
+    return best_avg_atr
+
+def calculate_atr_passed(row):
+    # Replace this with your actual implementation
+    # This is just an example, you may need to adjust it based on your actual data
+    atr = row['atr']
+    kline_data = getklineBinance(symbol = row['symbol'])[0]
+    close = float(kline_data['closePrice'])
+    open = float(kline_data['openPrice'])
+    atr_passed = round(100 * (abs(close - open)) / atr,2)
+    return atr_passed
+
+#Record JSON into DataFrame
+symbols = []
+opens = []
+closes = []
+highs = []
+lows = []
+volumes = []
+values = []
+price_changes = []
+reqBin = requestBinance(urlBinance)
+for i in range(0, len(reqBin)):
+    symbols.append(reqBin[i]['symbol'])
+    opens.append(reqBin[i]['openPrice'])
+    closes.append(reqBin[i]['lastPrice'])
+    highs.append(reqBin[i]['highPrice'])
+    lows.append(reqBin[i]['lowPrice'])
+    volumes.append(reqBin[i]['volume'])
+    values.append(reqBin[i]['quoteVolume'])
+    price_changes.append(reqBin[i]['priceChangePercent'])
+data = {
+    'symbol': symbols,
+    'open': opens,
+    'close': closes,
+    'high': highs,
+    'low': lows,
+    'volume': volumes,
+    'value': values,
+    'price_change' : price_changes
+}
+
+df = pd.DataFrame(data)
+
+#Convert all float-like strings into actual floats
+df['open'] = pd.to_numeric(df['open'])
+df['close'] = pd.to_numeric(df['close'])
+df['high'] = pd.to_numeric(df['high'])
+df['low'] = pd.to_numeric(df['low'])
+df['volume'] = pd.to_numeric(df['volume'])
+df['value'] = pd.to_numeric(df['value'])
+df['price_change'] = pd.to_numeric(df['price_change'])
+
+thresholdVol = int(input('Enter trading volume lower threshold value in mln $'))*1000000
+
+#Filtering out data
+df_filtered = df.query('value > @thresholdVol and symbol.str.endswith("USDT")') \
+                .sort_values('value', ascending = False)
+
+df_filtered['atr'] = df_filtered.apply(lambda row: findAtr(limit=14, endPeriod=5, symbol=row['symbol']), axis=1)
+df_filtered['atr_passed'] = df_filtered.apply(calculate_atr_passed, axis=1)
